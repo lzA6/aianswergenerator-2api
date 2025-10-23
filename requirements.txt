@@ -1,0 +1,7 @@
+# aianswergenerator-2api/requirements.txt
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+httpx
+loguru
