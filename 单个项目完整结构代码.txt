@@ -1,0 +1,412 @@
+项目 'aianswergenerator-2api' 的结构树:
+📂 aianswergenerator-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 aianswergenerator_provider.py
+            📄 base_provider.py
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8090
+
+--- 文件路径: .env.example ---
+
+# aianswergenerator-2api/.env.example
+# ====================================================================
+# aianswergenerator-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-aianswergenerator-2api-default-key-please-change-me
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8090
+
+
+--- 文件路径: Dockerfile ---
+
+# aianswergenerator-2api/Dockerfile
+FROM python:3.10-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+# aianswergenerator-2api/docker-compose.yml
+services:
+  nginx:
+    image: nginx:latest
+    container_name: aianswergenerator-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8090}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - aianswergenerator-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aianswergenerator-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - aianswergenerator-net
+
+networks:
+  aianswergenerator-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+# aianswergenerator-2api/main.py
+import sys
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.aianswergenerator_provider import AIAnswerGeneratorProvider
+
+# --- 配置 Loguru ---
+logger.remove()
+logger.add(
+    sys.stdout,
+    level="INFO",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}:{function}:{line}</cyan> - <level>{message}</level>",
+    colorize=True
+)
+
+# --- 全局 Provider 实例 ---
+provider = AIAnswerGeneratorProvider()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.info("服务已进入 'Pseudo-Stream' 模式。")
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    yield
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+# --- 安全依赖 ---
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+# --- API 路由 ---
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request):
+    try:
+        request_data = await request.json()
+        return await provider.chat_completion(request_data)
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", summary="根路径", include_in_schema=False)
+def root():
+    return {"message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}. 服务运行正常。"}
+
+
+--- 文件路径: nginx.conf ---
+
+# aianswergenerator-2api/nginx.conf
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream aianswergenerator_backend {
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://aianswergenerator_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # 流式传输优化
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+# aianswergenerator-2api/requirements.txt
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+httpx
+loguru
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+# aianswergenerator-2api/app/core/config.py
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Optional
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "aianswergenerator-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 aianswergenerator.pro 的后端 API (pollinations.ai) 转换为兼容 OpenAI 格式的代理。"
+
+    API_MASTER_KEY: Optional[str] = "1"
+    
+    API_REQUEST_TIMEOUT: int = 120
+    NGINX_PORT: int = 8090
+
+    # 伪流式输出的字间延迟（秒）
+    PSEUDO_STREAM_DELAY: float = 0.01
+
+    DEFAULT_MODEL: str = "aianswergenerator-openai"
+    KNOWN_MODELS: List[str] = ["aianswergenerator-openai"]
+    UPSTREAM_MODEL_PARAM: str = "openai"
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\aianswergenerator_provider.py ---
+
+# aianswergenerator-2api/app/providers/aianswergenerator_provider.py
+import httpx
+import json
+import time
+import uuid
+import asyncio
+import urllib.parse
+from typing import Dict, Any, AsyncGenerator
+
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.base_provider import BaseProvider
+from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
+
+class AIAnswerGeneratorProvider(BaseProvider):
+    BASE_URL = "https://text.pollinations.ai"
+
+    def __init__(self):
+        self.client = httpx.AsyncClient(timeout=settings.API_REQUEST_TIMEOUT)
+
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse:
+        
+        async def stream_generator() -> AsyncGenerator[bytes, None]:
+            request_id = f"chatcmpl-{uuid.uuid4()}"
+            model_name = request_data.get("model", settings.DEFAULT_MODEL)
+            
+            try:
+                messages = request_data.get("messages", [])
+                last_user_message = next((m['content'] for m in reversed(messages) if m.get('role') == 'user'), None)
+
+                if not last_user_message:
+                    raise HTTPException(status_code=400, detail="未找到用户消息。")
+
+                encoded_prompt = urllib.parse.quote(last_user_message)
+                upstream_url = f"{self.BASE_URL}/{encoded_prompt}"
+                
+                headers = self._prepare_headers()
+                params = {"model": settings.UPSTREAM_MODEL_PARAM}
+
+                logger.info(f"请求上游 URL: GET {upstream_url}")
+                response = await self.client.get(upstream_url, headers=headers, params=params)
+                response.raise_for_status()
+                
+                full_text = response.text
+                logger.info(f"收到上游完整响应，长度: {len(full_text)} characters.")
+
+                # --- 执行【模式：伪流式生成】 ---
+                logger.info("开始执行伪流式生成...")
+                for char in full_text:
+                    chunk = create_chat_completion_chunk(request_id, model_name, char)
+                    yield create_sse_data(chunk)
+                    await asyncio.sleep(settings.PSEUDO_STREAM_DELAY)
+                
+                final_chunk = create_chat_completion_chunk(request_id, model_name, "", "stop")
+                yield create_sse_data(final_chunk)
+                yield DONE_CHUNK
+                logger.success("伪流式生成完成。")
+
+            except httpx.HTTPStatusError as e:
+                logger.error(f"请求上游失败: {e.response.status_code} - {e.response.text}")
+                error_message = f"上游服务错误: {e.response.status_code}"
+                error_chunk = create_chat_completion_chunk(request_id, model_name, error_message, "stop")
+                yield create_sse_data(error_chunk)
+                yield DONE_CHUNK
+            except Exception as e:
+                logger.error(f"处理流时发生未知错误: {e}", exc_info=True)
+                error_message = f"内部服务器错误: {str(e)}"
+                error_chunk = create_chat_completion_chunk(request_id, model_name, error_message, "stop")
+                yield create_sse_data(error_chunk)
+                yield DONE_CHUNK
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    def _prepare_headers(self) -> Dict[str, str]:
+        return {
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Origin": "https://aianswergenerator.pro",
+            "Referer": "https://aianswergenerator.pro/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+
+    async def get_models(self) -> JSONResponse:
+        model_data = {
+            "object": "list",
+            "data": [
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                for name in settings.KNOWN_MODELS
+            ]
+        }
+        return JSONResponse(content=model_data)
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+# aianswergenerator-2api/app/providers/base_provider.py
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+# aianswergenerator-2api/app/utils/sse_utils.py
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的聊天补全流式块。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+
